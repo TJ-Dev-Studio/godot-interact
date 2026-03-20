@@ -138,7 +138,7 @@ var started: bool = false
 var start_delay: float = 1.0  # Let scene settle before input
 
 func _ready() -> void:
-    var json_str := "__ACTIONS_PLACEHOLDER__"
+    var json_str := '__ACTIONS_PLACEHOLDER__'
     var json := JSON.new()
     var err := json.parse(json_str)
     if err != OK:
@@ -162,23 +162,34 @@ func _process(delta: float) -> void:
     var action: Dictionary = actions[current_action]
     var action_type: String = action.get("type", "")
 
+    # Shared locals hoisted above match (Godot 4 match branches share scope)
+    var pos: Array
+    var dur: float
+    var from: Array
+    var to: Array
+    var key_name: String
+    var scroll_dir: String
+    var scroll_amt: int
+    var t: float
+    var current_pos: Vector2
+
     match action_type:
         "wait":
-            var wait_time: float = action.get("seconds", 1.0)
+            dur = action.get("seconds", 1.0)
             action_timer += delta
-            if action_timer >= wait_time:
+            if action_timer >= dur:
                 _advance()
         "touch":
-            var pos: Array = action.get("position", [0, 0])
+            pos = action.get("position", [0, 0])
             _simulate_touch(Vector2(pos[0], pos[1]))
             _advance()
         "drag":
-            var from: Array = action.get("from", [0, 0])
-            var to: Array = action.get("to", [0, 0])
-            var duration: float = action.get("duration", 0.5)
+            from = action.get("from", [0, 0])
+            to = action.get("to", [0, 0])
+            dur = action.get("duration", 0.5)
             drag_progress += delta
-            var t: float = clampf(drag_progress / duration, 0.0, 1.0)
-            var current_pos := Vector2(from[0], from[1]).lerp(Vector2(to[0], to[1]), t)
+            t = clampf(drag_progress / dur, 0.0, 1.0)
+            current_pos = Vector2(from[0], from[1]).lerp(Vector2(to[0], to[1]), t)
             if drag_progress == delta:
                 # First frame: press
                 _simulate_touch_press(current_pos)
@@ -188,23 +199,36 @@ func _process(delta: float) -> void:
                 _simulate_touch_release(current_pos)
                 _advance()
         "key":
-            var key_name: String = action.get("key", "")
-            var duration: float = action.get("duration", 0.0)
-            if duration > 0:
+            key_name = action.get("key", "")
+            dur = action.get("duration", 0.0)
+            if dur > 0:
                 action_timer += delta
                 _simulate_key_hold(key_name)
-                if action_timer >= duration:
+                if action_timer >= dur:
                     _simulate_key_release(key_name)
                     _advance()
             else:
                 _simulate_key_press(key_name)
                 _advance()
         "scroll":
-            var pos: Array = action.get("position", [0, 0])
-            var direction: String = action.get("direction", "up")
-            var amount: int = action.get("amount", 3)
-            _simulate_scroll(Vector2(pos[0], pos[1]), direction, amount)
+            pos = action.get("position", [0, 0])
+            scroll_dir = action.get("direction", "up")
+            scroll_amt = action.get("amount", 3)
+            _simulate_scroll(Vector2(pos[0], pos[1]), scroll_dir, scroll_amt)
             _advance()
+        "joystick":
+            var jx: float = action.get("dx", 0.0)
+            var jy: float = action.get("dy", 0.0)
+            dur = action.get("duration", 0.0)
+            _set_joystick(Vector2(jx, jy))
+            if dur > 0:
+                action_timer += delta
+                if action_timer >= dur:
+                    _set_joystick(Vector2.ZERO)
+                    _advance()
+            else:
+                _set_joystick(Vector2.ZERO)
+                _advance()
         _:
             push_warning("godot-interact: Unknown action type: %s" % action_type)
             _advance()
@@ -243,28 +267,62 @@ func _simulate_touch_release(pos: Vector2) -> void:
     event.index = 0
     Input.parse_input_event(event)
 
-func _simulate_key_press(action_name: String) -> void:
-    var event := InputEventAction.new()
-    event.action = action_name
-    event.pressed = true
-    Input.parse_input_event(event)
-    # Auto-release
-    var release := InputEventAction.new()
-    release.action = action_name
-    release.pressed = false
-    Input.parse_input_event.call_deferred(release)
+## Map WASD → Godot built-in actions (most reliable for action_press/release).
+const _ACTION_MAP := {
+    "W": "ui_up", "S": "ui_down", "A": "ui_left", "D": "ui_right",
+}
 
-func _simulate_key_hold(action_name: String) -> void:
-    var event := InputEventAction.new()
-    event.action = action_name
-    event.pressed = true
-    Input.parse_input_event(event)
+## Map other key names → Godot KEY_* constants (fallback for non-WASD).
+const _KEY_MAP := {
+    "SPACE": KEY_SPACE, "SHIFT": KEY_SHIFT, "ENTER": KEY_ENTER,
+    "UP": KEY_UP, "DOWN": KEY_DOWN, "LEFT": KEY_LEFT, "RIGHT": KEY_RIGHT,
+    "E": KEY_E, "Q": KEY_Q, "F": KEY_F, "R": KEY_R,
+    "1": KEY_1, "2": KEY_2, "3": KEY_3, "4": KEY_4,
+}
 
-func _simulate_key_release(action_name: String) -> void:
-    var event := InputEventAction.new()
-    event.action = action_name
-    event.pressed = false
-    Input.parse_input_event(event)
+## Split combined keys ("W+A") and press each.
+func _simulate_key_press(key_str: String) -> void:
+    for part in key_str.split("+"):
+        var k := part.strip_edges().to_upper()
+        if _ACTION_MAP.has(k):
+            Input.action_press(_ACTION_MAP[k])
+            Input.action_release.call_deferred(_ACTION_MAP[k])
+        elif _KEY_MAP.has(k):
+            var ev := InputEventKey.new()
+            ev.keycode = _KEY_MAP[k]
+            ev.pressed = true
+            Input.parse_input_event(ev)
+            var rel := InputEventKey.new()
+            rel.keycode = _KEY_MAP[k]
+            rel.pressed = false
+            Input.parse_input_event.call_deferred(rel)
+
+func _simulate_key_hold(key_str: String) -> void:
+    for part in key_str.split("+"):
+        var k := part.strip_edges().to_upper()
+        if _ACTION_MAP.has(k):
+            Input.action_press(_ACTION_MAP[k])
+        elif _KEY_MAP.has(k):
+            var ev := InputEventKey.new()
+            ev.keycode = _KEY_MAP[k]
+            ev.pressed = true
+            Input.parse_input_event(ev)
+
+func _simulate_key_release(key_str: String) -> void:
+    for part in key_str.split("+"):
+        var k := part.strip_edges().to_upper()
+        if _ACTION_MAP.has(k):
+            Input.action_release(_ACTION_MAP[k])
+        elif _KEY_MAP.has(k):
+            var ev := InputEventKey.new()
+            ev.keycode = _KEY_MAP[k]
+            ev.pressed = false
+            Input.parse_input_event(ev)
+
+func _set_joystick(input: Vector2) -> void:
+    var players := get_tree().get_nodes_in_group("player")
+    if players.size() > 0 and players[0].has_method("set_joystick_input"):
+        players[0].set_joystick_input(input)
 
 func _simulate_scroll(pos: Vector2, direction: String, amount: int) -> void:
     for i in amount:
@@ -280,11 +338,13 @@ func _simulate_scroll(pos: Vector2, direction: String, amount: int) -> void:
         Input.parse_input_event(event)
 GDSCRIPT
 
-    # Escape the JSON for embedding in GDScript string
+    # Replace placeholder with actual JSON.
+    # The template uses single-quoted GDScript string ('...') so double
+    # quotes in JSON don't need escaping.  Only backslashes need doubling
+    # and the sed delimiter (|) needs escaping (JSON won't contain either).
     local escaped_json
-    escaped_json=$(printf '%s' "$actions_json" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    escaped_json=$(printf '%s' "$actions_json" | sed 's/\\/\\\\/g; s/|/\\|/g')
 
-    # Replace placeholder with actual JSON
     if [[ "$(uname)" == "Darwin" ]]; then
         sed -i '' "s|__ACTIONS_PLACEHOLDER__|${escaped_json}|" "$output_path"
     else
